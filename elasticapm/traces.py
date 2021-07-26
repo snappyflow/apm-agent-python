@@ -34,6 +34,8 @@ import re
 import threading
 import time
 import timeit
+from django.conf import settings
+import elasticapm.base
 from collections import defaultdict
 
 from elasticapm.conf import constants
@@ -710,9 +712,11 @@ class capture_span(object):
                 if exc_val and not isinstance(span, DroppedSpan):
                     try:
                         exc_val._elastic_apm_span_id = span.id
+                        client = base.Client(settings.ELASTIC_APM)
+                        client.capture_exception(exc_info=(exc_type, exc_val, exc_tb), handled=True)
                     except AttributeError:
                         # could happen if the exception has __slots__
-                        pass
+                        logger.info("failed to create error span for handled exception")
             except LookupError:
                 logger.debug("ended non-existing span %s of type %s", self.name, self.type)
 
