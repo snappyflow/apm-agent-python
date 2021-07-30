@@ -35,7 +35,6 @@ import threading
 import time
 import timeit
 from django.conf import settings
-import elasticapm.base
 from collections import defaultdict
 
 from elasticapm.conf import constants
@@ -45,6 +44,12 @@ from elasticapm.metrics.base_metrics import Timer
 from elasticapm.utils import compat, encoding, get_name_from_func
 from elasticapm.utils.disttracing import TraceParent, TracingOptions
 from elasticapm.utils.logging import get_logger
+import sys
+if sys.version_info[0] < 3:
+   import base
+else:
+   from elasticapm import base
+
 
 __all__ = ("capture_span", "label", "set_transaction_name", "set_custom_context", "set_user_context")
 
