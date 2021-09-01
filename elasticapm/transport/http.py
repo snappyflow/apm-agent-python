@@ -169,8 +169,8 @@ class Transport(HTTPTransportBase):
             return current_version, None, max_age
 
     def _process_queue(self):
-        if not self.client.server_version:
-            self.fetch_server_info()
+        # if not self.client.server_version:
+        #     self.fetch_server_info()
         super()._process_queue()
 
     def fetch_server_info(self):
