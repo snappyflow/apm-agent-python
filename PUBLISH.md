@@ -3,8 +3,16 @@ Publish sf-elastic-apm pip package
 ==============
 [![made-with-python](https://img.shields.io/badge/Made%20with-Python-1f425f.svg)](https://www.python.org/) [![pypi-package](https://img.shields.io/badge/pypi-green)](https://pypi.org/project/sf-elastic-apm/)
 
+Build Info
+---------
 
-Steps
+- Before publishing update package version in [in elasticapm/version.py ](#) file located in root folder of application.
+
+- There are two ways to build package: Automatic and Manual.
+
+- Automatic build will be trigger when new github release is created.
+
+Manual Steps
 --------------
 
 
