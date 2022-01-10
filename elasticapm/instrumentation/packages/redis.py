@@ -59,9 +59,10 @@ class RedisInstrumentation(Redis3CheckMixin, AbstractInstrumentedModule):
     def call(self, module, method, wrapped, instance, args, kwargs):
         if len(args) > 0:
             wrapped_name = str(args[0])
+            if len(args) >= 2:
+                wrapped_name += ': {}'.format(args[1])
         else:
             wrapped_name = self.get_wrapped_name(wrapped, instance, method)
-
         with capture_span(wrapped_name, span_type="db", span_subtype="redis", span_action="query", leaf=True):
             return wrapped(*args, **kwargs)
 
