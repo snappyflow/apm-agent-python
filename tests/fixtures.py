@@ -189,6 +189,8 @@ def elasticapm_client(request):
     client_config.setdefault("span_frames_min_duration", -1)
     client_config.setdefault("metrics_interval", "0ms")
     client_config.setdefault("cloud_provider", False)
+    client_config.setdefault("span_compression_exact_match_max_duration", "0ms")
+    client_config.setdefault("span_compression_same_kind_max_duration", "0ms")
     client = TempStoreClient(**client_config)
     yield client
     client.close()
@@ -200,6 +202,16 @@ def elasticapm_client(request):
 
 
 @pytest.fixture()
+def elasticapm_transaction(elasticapm_client):
+    """
+    Useful fixture if spans from other fixtures should be captured.
+    This can be achieved by listing this fixture first.
+    """
+    transaction = elasticapm_client.begin_transaction("test")
+    yield transaction
+
+
+@pytest.fixture()
 def elasticapm_client_log_file(request):
     original_exceptionhook = sys.excepthook
     client_config = getattr(request, "param", {})
@@ -208,6 +220,8 @@ def elasticapm_client_log_file(request):
     client_config.setdefault("central_config", "false")
     client_config.setdefault("include_paths", ("*/tests/*",))
     client_config.setdefault("span_frames_min_duration", -1)
+    client_config.setdefault("span_compression_exact_match_max_duration", "0ms")
+    client_config.setdefault("span_compression_same_kind_max_duration", "0ms")
     client_config.setdefault("metrics_interval", "0ms")
     client_config.setdefault("cloud_provider", False)
     client_config.setdefault("log_level", "warning")
@@ -289,6 +303,8 @@ def sending_elasticapm_client(request, validating_httpserver):
     client_config.setdefault("secret_token", "test_key")
     client_config.setdefault("transport_class", "elasticapm.transport.http.Transport")
     client_config.setdefault("span_frames_min_duration", -1)
+    client_config.setdefault("span_compression_exact_match_max_duration", "0ms")
+    client_config.setdefault("span_compression_same_kind_max_duration", "0ms")
     client_config.setdefault("include_paths", ("*/tests/*",))
     client_config.setdefault("metrics_interval", "0ms")
     client_config.setdefault("central_config", "false")
@@ -343,6 +359,11 @@ class TempStoreClient(Client):
     def spans_for_transaction(self, transaction):
         """Test helper method to get all spans of a specific transaction"""
         return [span for span in self.events[SPAN] if span["transaction_id"] == transaction["id"]]
+
+
+@pytest.fixture()
+def temp_store_client():
+    return TempStoreClient
 
 
 @pytest.fixture()

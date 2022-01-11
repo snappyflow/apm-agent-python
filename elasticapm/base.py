@@ -36,11 +36,13 @@ import itertools
 import logging
 import os
 import platform
+import re
 import sys
 import threading
 import time
 import warnings
 from copy import deepcopy
+from typing import Optional, Tuple
 
 import elasticapm
 from elasticapm.conf import Config, VersionedConfig, constants
@@ -134,7 +136,7 @@ class Client(object):
         headers = {
             "Content-Type": "application/x-ndjson",
             "Content-Encoding": "gzip",
-            "User-Agent": "elasticapm-python/%s" % elasticapm.VERSION,
+            "User-Agent": self.get_user_agent(),
         }
 
         transport_kwargs = {
@@ -149,7 +151,7 @@ class Client(object):
             constants.EVENTS_API_PATH,
         )
         transport_class = import_string(self.config.transport_class)
-        self._transport = transport_class(self._api_endpoint_url, self, **transport_kwargs)
+        self._transport = transport_class(url=self._api_endpoint_url, client=self, **transport_kwargs)
         self.config.transport = self._transport
         self._thread_managers["transport"] = self._transport
 
@@ -199,7 +201,8 @@ class Client(object):
             self._metrics.register("elasticapm.metrics.sets.breakdown.BreakdownMetricSet")
         if self.config.prometheus_metrics:
             self._metrics.register("elasticapm.metrics.sets.prometheus.PrometheusMetrics")
-        self._thread_managers["metrics"] = self._metrics
+        if self.config.metrics_interval:
+            self._thread_managers["metrics"] = self._metrics
         compat.atexit_register(self.close)
         if self.config.central_config:
             self._thread_managers["config"] = self.config
@@ -417,6 +420,17 @@ class Client(object):
             self.logger.warning("Unknown value for CLOUD_PROVIDER, skipping cloud metadata: {}".format(provider))
             return {}
 
+    def get_user_agent(self) -> str:
+        """
+        Compiles the user agent, which will be added as a header to all requests
+        to the APM Server
+        """
+        if self.config.service_version:
+            service_version = re.sub(r"[^\t _\x21-\x27\x2a-\x5b\x5d-\x7e\x80-\xff]", "_", self.config.service_version)
+            return "apm-agent-python/{} ({} {})".format(elasticapm.VERSION, self.config.service_name, service_version)
+        else:
+            return "apm-agent-python/{} ({})".format(elasticapm.VERSION, self.config.service_name)
+
     def build_metadata(self):
         data = {
             "service": self.get_service_info(),
@@ -617,6 +631,20 @@ class Client(object):
         elif v < (3, 5):
             warnings.warn("The Elastic APM agent only supports Python 3.5+", DeprecationWarning)
 
+    def check_server_version(self, gte: Optional[Tuple[int]] = None, lte: Optional[Tuple[int]] = None) -> bool:
+        """
+        Check APM Server version against greater-or-equal and/or lower-or-equal limits, provided as tuples of integers.
+        If server_version is not set, always returns True.
+        :param gte: a tuple of ints describing the greater-or-equal limit, e.g. (7, 16)
+        :param lte: a tuple of ints describing the lower-or-equal limit, e.g. (7, 99)
+        :return: bool
+        """
+        if not self.server_version:
+            return True
+        gte = gte or (0,)
+        lte = lte or (2 ** 32,)  # let's assume APM Server version will never be greater than 2^32
+        return bool(gte <= self.server_version <= lte)
+
 
 class DummyClient(Client):
     """Sends messages into an empty void"""
@@ -625,11 +653,11 @@ class DummyClient(Client):
         return None
 
 
-def get_client():
+def get_client() -> Client:
     return CLIENT_SINGLETON
 
 
-def set_client(client):
+def set_client(client: Client):
     global CLIENT_SINGLETON
     if CLIENT_SINGLETON:
         logger = get_logger("elasticapm")

@@ -550,7 +550,6 @@ class Config(_ConfigBase):
         "METRICS_SETS",
         default=[
             "elasticapm.metrics.sets.cpu.CPUMetricSet",
-            "elasticapm.metrics.sets.transactions.TransactionsMetricSet",
         ],
     )
     metrics_interval = _ConfigValue(
@@ -577,6 +576,19 @@ class Config(_ConfigBase):
         validators=[
             UnitValidator(r"^((?:-)?\d+)(ms|s|m)?$", r"\d+(ms|s|m)", {"ms": 1, "s": 1000, "m": 60000, None: 1})
         ],
+        type=int,
+    )
+    span_compression_enabled = _BoolConfigValue("SPAN_COMPRESSION_ENABLED", default=False)
+    span_compression_exact_match_max_duration = _ConfigValue(
+        "SPAN_COMPRESSION_EXACT_MATCH_MAX_DURATION",
+        default=50,
+        validators=[duration_validator],
+        type=int,
+    )
+    span_compression_same_kind_max_duration = _ConfigValue(
+        "SPAN_COMPRESSION_SAME_KIND_MAX_DURATION",
+        default=5,
+        validators=[duration_validator],
         type=int,
     )
     collect_local_variables = _ConfigValue("COLLECT_LOCAL_VARIABLES", default="errors")
