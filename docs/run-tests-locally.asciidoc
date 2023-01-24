@@ -4,12 +4,12 @@
 To run tests locally you can make use of the docker images also used when running the whole test suite with Jenkins.
 Running the full test suite first does some linting and then runs the actual tests with different versions of Python and different web frameworks.
 For a full overview of the test matrix and supported versions have a look at
-https://github.com/elastic/apm-agent-python/blob/master/Jenkinsfile[Jenkins Configuration].
+https://github.com/elastic/apm-agent-python/blob/main/Jenkinsfile[Jenkins Configuration].
 
 [float]
 [[pre-commit]]
 ==== Pre Commit
-We run our git hooks on every commit to automatically point out issues in code. Those issues are also detected within the Jenkins pipeline.
+We run our git hooks on every commit to automatically point out issues in code. Those issues are also detected within the GitHub actions.
 Please follow the installation steps stated in https://pre-commit.com/#install.
 
 [float]
@@ -19,12 +19,12 @@ We run two code linters `isort` and `flake8`. You can trigger each single one lo
 
 [source,bash]
 ----
-$ ./tests/scripts/docker/isort.sh <pip-cache-dir>
+$ pre-commit run -a isort
 ----
 
 [source,bash]
 ----
-$ ./tests/scripts/docker/flake8.sh <pip-cache-dir>
+$ pre-commit run -a flake8
 ----
 
 [float]
@@ -34,7 +34,7 @@ We test that the code is formatted using `black`. You can trigger this check by 
 
 [source,bash]
 ----
-$ ./tests/scripts/docker/black.sh <pip-cache-dir>
+$ pre-commit run -a black
 ----
 
 [float]
@@ -59,7 +59,7 @@ NOTE: The `python-version` must be of format `python-version`, e.g. `python-3.6`
 The `framework` must be of format `framework-version`, e.g. `django-1.10` or `flask-0.12`.
 
 You can also run the unit tests outside of docker, by installing the relevant
-https://github.com/elastic/apm-agent-python/tree/master/tests/requirements[requirements file]
+https://github.com/elastic/apm-agent-python/tree/main/tests/requirements[requirements file]
 and then running `py.test` from the project root.
 
 ==== Integration testing
@@ -72,5 +72,7 @@ checkout, you might do something like this:
 
 [source,bash]
 ----
-$ ./scripts/compose.py start 7.3 --with-agent-python-django --with-opbeans-python --opbeans-python-agent-local-repo=~/elastic/apm-agent-python
+$ ./scripts/compose.py start 7.3 \
+    --with-agent-python-django --with-opbeans-python \
+    --opbeans-python-agent-local-repo=~/elastic/apm-agent-python
 ----

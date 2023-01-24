@@ -30,10 +30,11 @@
 
 import functools
 import warnings
+from typing import TypeVar
+
+_AnnotatedFunctionT = TypeVar("_AnnotatedFunctionT")
 
 # https://wiki.python.org/moin/PythonDecoratorLibrary#Smart_deprecation_warnings_.28with_valid_filenames.2C_line_numbers.2C_etc..29
-# Updated to work with 2.6 and 3+.
-from elasticapm.utils import compat
 
 
 def deprecated(alternative=None):
@@ -41,7 +42,7 @@ def deprecated(alternative=None):
     as deprecated. It will result in a warning being emitted
     when the function is used."""
 
-    def real_decorator(func):
+    def real_decorator(func: _AnnotatedFunctionT) -> _AnnotatedFunctionT:
         @functools.wraps(func)
         def new_func(*args, **kwargs):
             msg = "Call to deprecated function {0}.".format(func.__name__)
@@ -50,8 +51,8 @@ def deprecated(alternative=None):
             warnings.warn_explicit(
                 msg,
                 category=DeprecationWarning,
-                filename=compat.get_function_code(func).co_filename,
-                lineno=compat.get_function_code(func).co_firstlineno + 1,
+                filename=func.__code__.co_filename,
+                lineno=func.__code__.co_firstlineno + 1,
             )
             return func(*args, **kwargs)
 

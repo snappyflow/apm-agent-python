@@ -11,7 +11,7 @@ it is need as field to store the results of the tests.
 @Field def pythonTasksGen
 
 pipeline {
-  agent { label 'linux && immutable' }
+  agent { label 'linux-immutable && ubuntu-20' }
   environment {
     REPO = 'apm-agent-python'
     BASE_DIR = "src/github.com/elastic/${env.REPO}"
@@ -19,8 +19,6 @@ pipeline {
     NOTIFY_TO = credentials('notify-to')
     JOB_GCS_BUCKET = credentials('gcs-bucket')
     CODECOV_SECRET = 'secret/apm-team/ci/apm-agent-python-codecov'
-    GITHUB_CHECK_ITS_NAME = 'Integration Tests'
-    ITS_PIPELINE = 'apm-integration-tests-selector-mbp/master'
     BENCHMARK_SECRET  = 'secret/apm-team/ci/benchmark-cloud'
     OPBEANS_REPO = 'opbeans-python'
     HOME = "${env.WORKSPACE}"
@@ -40,7 +38,7 @@ pipeline {
     issueCommentTrigger("(${obltGitHubComments()}).?(full|benchmark)?")
   }
   parameters {
-    booleanParam(name: 'Run_As_Master_Branch', defaultValue: false, description: 'Allow to run any steps on a PR, some steps normally only run on master branch.')
+    booleanParam(name: 'Run_As_Main_Branch', defaultValue: false, description: 'Allow to run any steps on a PR, some steps normally only run on main branch.')
     booleanParam(name: 'bench_ci', defaultValue: true, description: 'Enable benchmarks.')
     booleanParam(name: 'tests_ci', defaultValue: true, description: 'Enable tests.')
     booleanParam(name: 'package_ci', defaultValue: true, description: 'Enable building packages.')
@@ -69,35 +67,6 @@ pipeline {
             }
           }
         }
-        stage('Sanity checks') {
-          when {
-            beforeAgent true
-            allOf {
-              expression { return env.ONLY_DOCS == "false" }
-              anyOf {
-                not { changeRequest() }
-                expression { return params.Run_As_Master_Branch }
-              }
-            }
-          }
-          environment {
-            PATH = "${env.WORKSPACE}/.local/bin:${env.WORKSPACE}/bin:${env.PATH}"
-          }
-          steps {
-            withGithubNotify(context: 'Sanity checks', tab: 'tests') {
-              deleteDir()
-              unstash 'source'
-              script {
-                docker.image('python:3.7-stretch').inside(){
-                  dir("${BASE_DIR}"){
-                    // registry: '' will help to disable the docker login
-                    preCommit(commit: "${GIT_BASE_COMMIT}", junit: true, registry: '')
-                  }
-                }
-              }
-            }
-          }
-        }
         /**
         Execute unit tests.
         */
@@ -117,15 +86,17 @@ pipeline {
               dir("${BASE_DIR}"){
                 script {
                   // To enable the full test matrix upon GitHub PR comments
+                  def pythonFile = '.ci/.jenkins_python.yml'
                   def frameworkFile = '.ci/.jenkins_framework.yml'
                   if (env.GITHUB_COMMENT?.contains('full')) {
                     log(level: 'INFO', text: 'Full test matrix has been enabled.')
                     frameworkFile = '.ci/.jenkins_framework_full.yml'
+                    pythonFile = '.ci/.jenkins_python_full.yml'
                   }
                   pythonTasksGen = new PythonParallelTaskGenerator(
                     xKey: 'PYTHON_VERSION',
                     yKey: 'FRAMEWORK',
-                    xFile: ".ci/.jenkins_python.yml",
+                    xFile: pythonFile,
                     yFile: frameworkFile,
                     exclusionFile: ".ci/.jenkins_exclude.yml",
                     tag: "Python",
@@ -168,39 +139,41 @@ pipeline {
               deleteDir()
               unstash 'source'
               dir("${BASE_DIR}"){
-                sh script: 'pip3 install --user cibuildwheel', label: "Installing cibuildwheel"
-                sh script: 'mkdir wheelhouse', label: "creating wheelhouse"
-                // skip pypy builds with CIBW_SKIP=pp*
-                sh script: 'CIBW_SKIP="pp* cp27* cp35*" cibuildwheel --platform linux --output-dir wheelhouse; ls -l wheelhouse'
+                sh script: 'pip3 install --user wheel', label: "Installing wheel"
+                sh script: 'python3 setup.py bdist_wheel', label: "Building universal wheel"
               }
-              stash allowEmpty: true, name: 'packages', includes: "${BASE_DIR}/wheelhouse/*.whl,${BASE_DIR}/dist/*.tar.gz", useDefaultExcludes: false
+              stash allowEmpty: true, name: 'packages', includes: "${BASE_DIR}/dist/*.whl,${BASE_DIR}/dist/*.tar.gz", useDefaultExcludes: false
             }
           }
         }
-        stage('Integration Tests') {
-          agent none
-          when {
-            beforeAgent true
-            allOf {
-              expression { return env.ONLY_DOCS == "false" }
-              anyOf {
-                changeRequest()
-                expression { return !params.Run_As_Master_Branch }
+        stage('Publish snapshot packages') {
+          options { skipDefaultCheckout() }
+          environment {
+            PATH = "${env.WORKSPACE}/.local/bin:${env.WORKSPACE}/bin:${env.PATH}"
+            BUCKET_NAME = 'oblt-artifacts'
+            DOCKER_REGISTRY = 'docker.elastic.co'
+            DOCKER_REGISTRY_SECRET = 'secret/observability-team/ci/docker-registry/prod'
+            GCS_ACCOUNT_SECRET = 'secret/observability-team/ci/snapshoty'
+          }
+          when { branch 'main' }
+          steps {
+            withGithubNotify(context: 'Publish snapshot packages') {
+              deleteDir()
+              unstash 'source'
+              unstash 'packages'
+              dir(env.BASE_DIR) {
+                snapshoty(
+                  bucket: env.BUCKET_NAME,
+                  gcsAccountSecret: env.GCS_ACCOUNT_SECRET,
+                  dockerRegistry: env.DOCKER_REGISTRY,
+                  dockerSecret: env.DOCKER_REGISTRY_SECRET
+                )
               }
             }
-          }
-          steps {
-            build(job: env.ITS_PIPELINE, propagate: false, wait: false,
-                  parameters: [string(name: 'INTEGRATION_TEST', value: 'Python'),
-                              string(name: 'BUILD_OPTS', value: "--with-agent-python-flask --python-agent-package git+https://github.com/${env.CHANGE_FORK?.trim() ?: 'elastic' }/${env.REPO}.git@${env.GIT_BASE_COMMIT} --opbeans-python-agent-branch ${env.GIT_BASE_COMMIT}"),
-                              string(name: 'GITHUB_CHECK_NAME', value: env.GITHUB_CHECK_ITS_NAME),
-                              string(name: 'GITHUB_CHECK_REPO', value: env.REPO),
-                              string(name: 'GITHUB_CHECK_SHA1', value: env.GIT_BASE_COMMIT)])
-            githubNotify(context: "${env.GITHUB_CHECK_ITS_NAME}", description: "${env.GITHUB_CHECK_ITS_NAME} ...", status: 'PENDING', targetUrl: "${env.JENKINS_URL}search/?q=${env.ITS_PIPELINE.replaceAll('/','+')}")
           }
         }
         stage('Benchmarks') {
-          agent { label 'metal' }
+          agent { label 'microbenchmarks-pool' }
           options { skipDefaultCheckout() }
           environment {
             AGENT_WORKDIR = "${env.WORKSPACE}/${env.BUILD_NUMBER}/${env.BASE_DIR}"
@@ -212,8 +185,8 @@ pipeline {
             beforeAgent true
             allOf {
               anyOf {
-                branch 'master'
-                expression { return params.Run_As_Master_Branch }
+                branch 'main'
+                expression { return params.Run_As_Main_Branch }
                 expression { return env.GITHUB_COMMENT?.contains('benchmark') }
               }
               expression { return params.bench_ci }
@@ -257,7 +230,7 @@ pipeline {
         beforeInput true
         anyOf {
           tag pattern: 'v\\d+.*', comparator: 'REGEXP'
-          expression { return params.Run_As_Master_Branch }
+          expression { return params.Run_As_Main_Branch }
         }
       }
       stages {
@@ -308,17 +281,18 @@ pipeline {
             beforeInput true
             anyOf {
               tag pattern: 'v\\d+\\.\\d+\\.\\d+', comparator: 'REGEXP'
-              expression { return params.Run_As_Master_Branch }
+              expression { return params.Run_As_Main_Branch }
             }
           }
           steps {
             deleteDir()
             dir("${OPBEANS_REPO}"){
-              git credentialsId: 'f6c7695a-671e-4f4f-a331-acdce44ff9ba',
-                  url: "git@github.com:elastic/${OPBEANS_REPO}.git"
+              git(credentialsId: 'f6c7695a-671e-4f4f-a331-acdce44ff9ba',
+                  url: "git@github.com:elastic/${OPBEANS_REPO}.git",
+                  branch: 'main')
               // It's required to transform the tag value to the artifact version
               sh script: ".ci/bump-version.sh ${env.BRANCH_NAME.replaceAll('^v', '')}", label: 'Bump version'
-              // The opbeans pipeline will trigger a release for the master branch
+              // The opbeans pipeline will trigger a release for the main branch
               gitPush()
               // The opbeans pipeline will trigger a release for the release tag
               gitCreateTag(tag: "${env.BRANCH_NAME}")
@@ -330,7 +304,7 @@ pipeline {
   }
   post {
     cleanup {
-      notifyBuildResult(analyzeFlakey: true, jobName: getFlakyJobName(withBranch: 'master'))
+      notifyBuildResult(analyzeFlakey: true, jobName: getFlakyJobName(withBranch: 'main'))
     }
   }
 }
@@ -407,9 +381,17 @@ def runScript(Map params = [:]){
   deleteDir()
   sh "mkdir ${env.PIP_CACHE}"
   unstash 'source'
-  dir("${BASE_DIR}"){
-    retryWithSleep(retries: 2, seconds: 5, backoff: true) {
-      sh("./tests/scripts/docker/run_tests.sh ${python} ${framework}")
+  filebeat(output: "${label}_${framework}.log", workdir: "${env.WORKSPACE}") {
+    dir("${BASE_DIR}"){
+      withEnv([
+        "LOCAL_USER_ID=${sh(script:'id -u', returnStdout: true).trim()}",
+        "LOCAL_GROUP_ID=${sh(script:'id -g', returnStdout: true).trim()}",
+        "LOCALSTACK_VOLUME_DIR=localstack_data"
+      ]) {
+        retryWithSleep(retries: 2, seconds: 5, backoff: true) {
+          sh("./tests/scripts/docker/run_tests.sh ${python} ${framework}")
+        }
+      }
     }
   }
 }
@@ -424,7 +406,7 @@ def releasePackages(){
     python setup.py sdist
     echo "Uploading to ${REPO_URL} with user \${TWINE_USER}"
     python -m twine upload --username "\${TWINE_USER}" --password "\${TWINE_PASSWORD}" --skip-existing --repository-url \${REPO_URL} dist/*.tar.gz
-    python -m twine upload --username "\${TWINE_USER}" --password "\${TWINE_PASSWORD}" --skip-existing --repository-url \${REPO_URL} wheelhouse/*.whl
+    python -m twine upload --username "\${TWINE_USER}" --password "\${TWINE_PASSWORD}" --skip-existing --repository-url \${REPO_URL} dist/*.whl
     """)
   }
 }
@@ -492,9 +474,9 @@ def convergeCoverage() {
         )
       }
     }
-    sh('python3 -m coverage combine && python3 -m coverage xml')
-    cobertura coberturaReportFile: 'coverage.xml'
+    sh(script: 'python3 -m coverage combine && python3 -m coverage xml', label: 'python coverage')
   }
+  coverageReport(baseDir: "${BASE_DIR}", reportFiles: 'coverage.html', coverageFiles: 'coverage.xml')
 }
 
 def generateResultsReport() {

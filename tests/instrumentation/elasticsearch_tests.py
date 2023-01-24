@@ -34,6 +34,8 @@ pytest.importorskip("elasticsearch")  # isort:skip
 
 import json
 import os
+import urllib.parse
+from unittest import mock
 
 from elasticsearch import VERSION as ES_VERSION
 from elasticsearch import Elasticsearch
@@ -41,7 +43,6 @@ from elasticsearch.serializer import JSONSerializer
 
 import elasticapm
 from elasticapm.conf.constants import TRANSACTION
-from elasticapm.utils import compat
 
 pytestmark = [pytest.mark.elasticsearch]
 
@@ -50,6 +51,17 @@ if "ES_URL" not in os.environ:
 
 
 document_type = "_doc" if ES_VERSION[0] >= 6 else "doc"
+
+
+def get_kwargs(document=None, document_kwarg_name="document"):
+    if ES_VERSION[0] < 6:
+        return {"doc_type": "doc", "body": document} if document else {"doc_type": "doc"}
+    if ES_VERSION[0] < 7:
+        return {"doc_type": "_doc", "body": document} if document else {"doc_type": "_doc"}
+    elif ES_VERSION[0] < 8:
+        return {"body": document} if document else {}
+    else:
+        return {document_kwarg_name: document} if document else {}
 
 
 class NumberObj:
@@ -67,7 +79,7 @@ class SpecialEncoder(JSONSerializer):
         if isinstance(obj, dict):
 
             def yield_key_value(d):
-                for key, value in compat.iteritems(d):
+                for key, value in d.items():
                     try:
                         yield self.default(key), self.force_key_encoding(value)
                     except TypeError:
@@ -85,6 +97,7 @@ class SpecialEncoder(JSONSerializer):
 def elasticsearch(request):
     """Elasticsearch client fixture."""
     client = Elasticsearch(hosts=os.environ["ES_URL"], serializer=SpecialEncoder())
+    client.indices.delete(index="*")
     try:
         yield client
     finally:
@@ -96,6 +109,7 @@ def test_ping(instrument, elasticapm_client, elasticsearch):
     elasticapm_client.begin_transaction("test")
     result = elasticsearch.ping()
     elasticapm_client.end_transaction("test", "OK")
+    parsed_url = urllib.parse.urlparse(os.environ["ES_URL"])
 
     transaction = elasticapm_client.events[TRANSACTION][0]
     spans = elasticapm_client.spans_for_transaction(transaction)
@@ -106,10 +120,49 @@ def test_ping(instrument, elasticapm_client, elasticsearch):
     assert span["subtype"] == "elasticsearch"
     assert span["action"] == "query"
     assert span["context"]["destination"] == {
-        "address": os.environ["ES_URL"],
+        "address": parsed_url.hostname,
+        "port": parsed_url.port,
         "service": {"name": "", "resource": "elasticsearch", "type": ""},
     }
     assert span["context"]["http"]["status_code"] == 200
+
+
+@pytest.mark.integrationtest
+def test_ping_db_instance(instrument, elasticapm_client, elasticsearch):
+    # some ugly code to smuggle the "x-found-handling-cluster" header into
+    # the response from Elasticsearch
+    try:
+        import elastic_transport
+
+        pool = elasticsearch._transport.node_pool.get().pool
+    except ImportError:
+        pool = elasticsearch.transport.connection_pool.get_connection().pool
+
+    original_urlopen = pool.urlopen
+
+    def wrapper(*args, **kwargs):
+        result = original_urlopen(*args, **kwargs)
+        result.headers.update({"x-found-handling-cluster": "foo"})
+        return result
+
+    elasticapm_client.begin_transaction("test")
+    with mock.patch.object(pool, "urlopen", wraps=wrapper):
+        result = elasticsearch.ping()
+
+    elasticapm_client.end_transaction("test", "OK")
+    parsed_url = urllib.parse.urlparse(os.environ["ES_URL"])
+
+    transaction = elasticapm_client.events[TRANSACTION][0]
+    spans = elasticapm_client.spans_for_transaction(transaction)
+    assert len(spans) == 1
+    span = spans[0]
+    assert span["name"] == "ES HEAD /"
+    assert span["context"]["destination"] == {
+        "address": parsed_url.hostname,
+        "port": parsed_url.port,
+        "service": {"name": "", "resource": "elasticsearch/foo", "type": ""},
+    }
+    assert span["context"]["db"]["instance"] == "foo"
 
 
 @pytest.mark.integrationtest
@@ -133,12 +186,12 @@ def test_info(instrument, elasticapm_client, elasticsearch):
 @pytest.mark.integrationtest
 def test_create(instrument, elasticapm_client, elasticsearch):
     elasticapm_client.begin_transaction("test")
-    if ES_VERSION[0] < 7:
-        r1 = elasticsearch.create(index="tweets", doc_type=document_type, id=1, body={"user": "kimchy", "text": "hola"})
-    else:
-        r1 = elasticsearch.create(index="tweets", id=1, body={"user": "kimchy", "text": "hola"})
-    r2 = elasticsearch.create(
-        index="tweets", doc_type=document_type, id=2, body={"user": "kimchy", "text": "hola"}, refresh=True
+    elasticsearch.create(index="tweets", id="1", **get_kwargs({"user": "kimchy", "text": "hola"}))
+    elasticsearch.create(
+        index="tweets",
+        id="2",
+        refresh=True,
+        **get_kwargs({"user": "kimchy", "text": "hola"}),
     )
     elasticapm_client.end_transaction("test", "OK")
 
@@ -152,6 +205,7 @@ def test_create(instrument, elasticapm_client, elasticsearch):
             assert span["name"] in (
                 "ES PUT /tweets/%s/%d/_create" % (document_type, i + 1),
                 "ES PUT /tweets/_create/%d" % (i + 1),
+                "ES PUT /tweets/_create/%d?refresh=true" % (i + 1),
             )
         else:
             assert span["name"] == "ES PUT /tweets/%s/%d" % (document_type, i + 1)
@@ -166,13 +220,8 @@ def test_create(instrument, elasticapm_client, elasticsearch):
 @pytest.mark.integrationtest
 def test_index(instrument, elasticapm_client, elasticsearch):
     elasticapm_client.begin_transaction("test")
-    if ES_VERSION[0] < 7:
-        r1 = elasticsearch.index("tweets", document_type, {"user": "kimchy", "text": "hola"})
-    else:
-        r1 = elasticsearch.index(index="tweets", body={"user": "kimchy", "text": "hola"})
-    r2 = elasticsearch.index(
-        index="tweets", doc_type=document_type, body={"user": "kimchy", "text": "hola"}, refresh=True
-    )
+    r1 = elasticsearch.index(index="tweets", **get_kwargs({"user": "kimchy", "text": "hola"}))
+    r2 = elasticsearch.index(index="tweets", refresh=True, **get_kwargs({"user": "kimchy", "text": "hola"}))
     elasticapm_client.end_transaction("test", "OK")
 
     transaction = elasticapm_client.events[TRANSACTION][0]
@@ -181,7 +230,7 @@ def test_index(instrument, elasticapm_client, elasticsearch):
     assert len(spans) == 2
 
     for span in spans:
-        assert span["name"] == "ES POST /tweets/%s" % document_type
+        assert span["name"] in ("ES POST /tweets/%s" % document_type, "ES POST /tweets/_doc?refresh=true")
         assert span["type"] == "db"
         assert span["subtype"] == "elasticsearch"
         assert span["action"] == "query"
@@ -192,11 +241,9 @@ def test_index(instrument, elasticapm_client, elasticsearch):
 
 @pytest.mark.integrationtest
 def test_exists(instrument, elasticapm_client, elasticsearch):
-    elasticsearch.create(
-        index="tweets", doc_type=document_type, id=1, body={"user": "kimchy", "text": "hola"}, refresh=True
-    )
+    elasticsearch.create(index="tweets", id="1", refresh=True, **get_kwargs({"user": "kimchy", "text": "hola"}))
     elasticapm_client.begin_transaction("test")
-    result = elasticsearch.exists(id=1, index="tweets", doc_type=document_type)
+    result = elasticsearch.exists(id="1", index="tweets", **get_kwargs())
     elasticapm_client.end_transaction("test", "OK")
 
     transaction = elasticapm_client.events[TRANSACTION][0]
@@ -215,15 +262,13 @@ def test_exists(instrument, elasticapm_client, elasticsearch):
 @pytest.mark.skipif(ES_VERSION[0] < 5, reason="unsupported method")
 @pytest.mark.integrationtest
 def test_exists_source(instrument, elasticapm_client, elasticsearch):
-    elasticsearch.create(
-        index="tweets", doc_type=document_type, id=1, body={"user": "kimchy", "text": "hola"}, refresh=True
-    )
+    elasticsearch.create(index="tweets", id="1", refresh=True, **get_kwargs({"user": "kimchy", "text": "hola"}))
     elasticapm_client.begin_transaction("test")
     if ES_VERSION[0] < 7:
         assert elasticsearch.exists_source("tweets", document_type, 1) is True
     else:
-        assert elasticsearch.exists_source(index="tweets", id=1, doc_type=document_type) is True
-    assert elasticsearch.exists_source(index="tweets", doc_type=document_type, id=1) is True
+        assert bool(elasticsearch.exists_source(index="tweets", id="1", **get_kwargs())) is True
+    assert bool(elasticsearch.exists_source(index="tweets", id="1", **get_kwargs())) is True
     elasticapm_client.end_transaction("test", "OK")
 
     transaction = elasticapm_client.events[TRANSACTION][0]
@@ -232,7 +277,7 @@ def test_exists_source(instrument, elasticapm_client, elasticsearch):
     assert len(spans) == 2
 
     for span in spans:
-        assert span["name"] == "ES HEAD /tweets/%s/1/_source" % document_type
+        assert span["name"] in ("ES HEAD /tweets/%s/1/_source" % document_type, "ES HEAD /tweets/_source/1")
         assert span["type"] == "db"
         assert span["subtype"] == "elasticsearch"
         assert span["action"] == "query"
@@ -243,17 +288,15 @@ def test_exists_source(instrument, elasticapm_client, elasticsearch):
 
 @pytest.mark.integrationtest
 def test_get(instrument, elasticapm_client, elasticsearch):
-    elasticsearch.create(
-        index="tweets", doc_type=document_type, id=1, body={"user": "kimchy", "text": "hola"}, refresh=True
-    )
+    elasticsearch.create(index="tweets", id="1", refresh=True, **get_kwargs({"user": "kimchy", "text": "hola"}))
     elasticapm_client.begin_transaction("test")
     # this is a fun one. Order pre-6x was (index, id, doc_type), changed to (index, doc_type, id) in 6.x, and reverted
     # to (index, id, doc_type) in 7.x. OK then.
     if ES_VERSION[0] == 6:
         r1 = elasticsearch.get("tweets", document_type, 1)
     else:
-        r1 = elasticsearch.get(index="tweets", id=1, doc_type=document_type)
-    r2 = elasticsearch.get(index="tweets", doc_type=document_type, id=1)
+        r1 = elasticsearch.get(index="tweets", id="1", **get_kwargs())
+    r2 = elasticsearch.get(index="tweets", id="1", **get_kwargs())
     elasticapm_client.end_transaction("test", "OK")
 
     transaction = elasticapm_client.events[TRANSACTION][0]
@@ -275,15 +318,13 @@ def test_get(instrument, elasticapm_client, elasticsearch):
 
 @pytest.mark.integrationtest
 def test_get_source(instrument, elasticapm_client, elasticsearch):
-    elasticsearch.create(
-        index="tweets", doc_type=document_type, id=1, body={"user": "kimchy", "text": "hola"}, refresh=True
-    )
+    elasticsearch.create(index="tweets", refresh=True, id="1", **get_kwargs({"user": "kimchy", "text": "hola"}))
     elasticapm_client.begin_transaction("test")
     if ES_VERSION[0] < 7:
         r1 = elasticsearch.get_source("tweets", document_type, 1)
     else:
-        r1 = elasticsearch.get_source(index="tweets", id=1, doc_type=document_type)
-    r2 = elasticsearch.get_source(index="tweets", doc_type=document_type, id=1)
+        r1 = elasticsearch.get_source(index="tweets", id="1", **get_kwargs())
+    r2 = elasticsearch.get_source(index="tweets", id="1", **get_kwargs())
     elasticapm_client.end_transaction("test", "OK")
 
     transaction = elasticapm_client.events[TRANSACTION][0]
@@ -295,7 +336,7 @@ def test_get_source(instrument, elasticapm_client, elasticsearch):
     assert len(spans) == 2
 
     for span in spans:
-        assert span["name"] == "ES GET /tweets/%s/1/_source" % document_type
+        assert span["name"] in ("ES GET /tweets/%s/1/_source" % document_type, "ES GET /tweets/_source/1")
         assert span["type"] == "db"
         assert span["subtype"] == "elasticsearch"
         assert span["action"] == "query"
@@ -306,23 +347,19 @@ def test_get_source(instrument, elasticapm_client, elasticsearch):
 
 @pytest.mark.integrationtest
 def test_update_document(instrument, elasticapm_client, elasticsearch):
-    elasticsearch.create(
-        index="tweets", doc_type=document_type, id=1, body={"user": "kimchy", "text": "hola"}, refresh=True
-    )
+    elasticsearch.create(index="tweets", id="1", refresh=True, **get_kwargs({"user": "kimchy", "text": "hola"}))
     elasticapm_client.begin_transaction("test")
-    r1 = elasticsearch.update(
-        index="tweets", id=1, doc_type=document_type, body={"doc": {"text": "adios"}}, refresh=True
-    )
+    r1 = elasticsearch.update(index="tweets", id=1, body={"doc": {"text": "adios"}}, refresh=True, **get_kwargs())
     elasticapm_client.end_transaction("test", "OK")
 
     transaction = elasticapm_client.events[TRANSACTION][0]
-    r2 = elasticsearch.get(index="tweets", doc_type=document_type, id=1)
+    r2 = elasticsearch.get(index="tweets", id="1", **get_kwargs())
     assert r2["_source"] == {"user": "kimchy", "text": "adios"}
     spans = elasticapm_client.spans_for_transaction(transaction)
     assert len(spans) == 1
 
     span = spans[0]
-    assert span["name"] == "ES POST /tweets/%s/1/_update" % document_type
+    assert span["name"] in ("ES POST /tweets/_update/1", "ES POST /tweets/%s/1/_update" % document_type)
     assert span["type"] == "db"
     assert span["subtype"] == "elasticsearch"
     assert span["action"] == "query"
@@ -334,7 +371,7 @@ def test_update_document(instrument, elasticapm_client, elasticsearch):
 @pytest.mark.integrationtest
 def test_search_body(instrument, elasticapm_client, elasticsearch):
     elasticsearch.create(
-        index="tweets", doc_type=document_type, id=1, body={"user": "kimchy", "text": "hola", "userid": 1}, refresh=True
+        index="tweets", id="1", refresh=True, **get_kwargs({"user": "kimchy", "text": "hola", "userid": 1})
     )
     elasticapm_client.begin_transaction("test")
     search_query = {"query": {"term": {"user": "kimchy"}}, "sort": ["userid"]}
@@ -357,16 +394,40 @@ def test_search_body(instrument, elasticapm_client, elasticsearch):
     ) or json.loads(span["context"]["db"]["statement"]) == json.loads(
         '{"query": {"term": {"user": "kimchy"}}, "sort": ["userid"]}'
     )
-    if ES_VERSION[0] >= 7:
+    if ES_VERSION[0] >= 6:
         assert span["context"]["db"]["rows_affected"] == 1
+    assert span["context"]["http"]["status_code"] == 200
+
+
+@pytest.mark.skipif(ES_VERSION[0] < 7, reason="track_total_hits unsupported")
+@pytest.mark.integrationtest
+def test_search_track_total_hits_false(instrument, elasticapm_client, elasticsearch):
+    elasticsearch.create(
+        index="tweets", id="1", refresh=True, **get_kwargs({"user": "kimchy", "text": "hola", "userid": 1})
+    )
+    elasticapm_client.begin_transaction("test")
+    search_query = {"query": {"term": {"user": "kimchy"}}, "sort": ["userid"]}
+    result = elasticsearch.search(body=search_query, track_total_hits=False)
+    elasticapm_client.end_transaction("test", "OK")
+
+    transaction = elasticapm_client.events[TRANSACTION][0]
+    assert result["hits"]["hits"][0]["_source"] == {"user": "kimchy", "text": "hola", "userid": 1}
+    spans = elasticapm_client.spans_for_transaction(transaction)
+    assert len(spans) == 1
+    span = spans[0]
+    # Depending on ES_VERSION, could be /_all/_search or /_search, and GET or POST
+    assert span["name"] in ("ES GET /_search", "ES GET /_all/_search", "ES POST /_search")
+    assert span["type"] == "db"
+    assert span["subtype"] == "elasticsearch"
+    assert span["action"] == "query"
+    assert span["context"]["db"]["type"] == "elasticsearch"
+    assert "rows_affected" not in span["context"]["db"]
     assert span["context"]["http"]["status_code"] == 200
 
 
 @pytest.mark.integrationtest
 def test_search_querystring(instrument, elasticapm_client, elasticsearch):
-    elasticsearch.create(
-        index="tweets", doc_type=document_type, id=1, body={"user": "kimchy", "text": "hola"}, refresh=True
-    )
+    elasticsearch.create(index="tweets", id="1", refresh=True, **get_kwargs({"user": "kimchy", "text": "hola"}))
     elasticapm_client.begin_transaction("test")
     search_query = "user:kimchy"
     result = elasticsearch.search(q=search_query, index="tweets")
@@ -385,16 +446,14 @@ def test_search_querystring(instrument, elasticapm_client, elasticsearch):
     assert span["action"] == "query"
     assert span["context"]["db"]["type"] == "elasticsearch"
     assert span["context"]["db"]["statement"] == "q=user:kimchy"
-    if ES_VERSION[0] >= 7:
+    if ES_VERSION[0] >= 6:
         assert span["context"]["db"]["rows_affected"] == 1
     assert span["context"]["http"]["status_code"] == 200
 
 
 @pytest.mark.integrationtest
 def test_search_both(instrument, elasticapm_client, elasticsearch):
-    elasticsearch.create(
-        index="tweets", doc_type=document_type, id=1, body={"user": "kimchy", "text": "hola"}, refresh=True
-    )
+    elasticsearch.create(index="tweets", id="1", refresh=True, **get_kwargs({"user": "kimchy", "text": "hola"}))
     elasticapm_client.begin_transaction("test")
     search_querystring = "text:hola"
     search_query = {"query": {"term": {"user": "kimchy"}}}
@@ -420,9 +479,7 @@ def test_search_both(instrument, elasticapm_client, elasticsearch):
 
 @pytest.mark.integrationtest
 def test_count_body(instrument, elasticapm_client, elasticsearch):
-    elasticsearch.create(
-        index="tweets", doc_type=document_type, id=1, body={"user": "kimchy", "text": "hola"}, refresh=True
-    )
+    elasticsearch.create(index="tweets", id="1", refresh=True, **get_kwargs({"user": "kimchy", "text": "hola"}))
     elasticapm_client.begin_transaction("test")
     search_query = {"query": {"term": {"user": "kimchy"}}}
     result = elasticsearch.count(body=search_query)
@@ -447,9 +504,7 @@ def test_count_body(instrument, elasticapm_client, elasticsearch):
 
 @pytest.mark.integrationtest
 def test_count_querystring(instrument, elasticapm_client, elasticsearch):
-    elasticsearch.create(
-        index="tweets", doc_type=document_type, id=1, body={"user": "kimchy", "text": "hola"}, refresh=True
-    )
+    elasticsearch.create(index="tweets", id="1", refresh=True, **get_kwargs({"user": "kimchy", "text": "hola"}))
     elasticapm_client.begin_transaction("test")
     search_query = "user:kimchy"
     result = elasticsearch.count(q=search_query, index="tweets")
@@ -473,11 +528,9 @@ def test_count_querystring(instrument, elasticapm_client, elasticsearch):
 
 @pytest.mark.integrationtest
 def test_delete(instrument, elasticapm_client, elasticsearch):
-    elasticsearch.create(
-        index="tweets", doc_type=document_type, id=1, body={"user": "kimchy", "text": "hola"}, refresh=True
-    )
+    elasticsearch.create(index="tweets", id="1", refresh=True, **get_kwargs({"user": "kimchy", "text": "hola"}))
     elasticapm_client.begin_transaction("test")
-    result = elasticsearch.delete(id=1, index="tweets", doc_type=document_type)
+    result = elasticsearch.delete(id="1", index="tweets", **get_kwargs())
     elasticapm_client.end_transaction("test", "OK")
 
     transaction = elasticapm_client.events[TRANSACTION][0]
@@ -494,8 +547,8 @@ def test_delete(instrument, elasticapm_client, elasticsearch):
 
 @pytest.mark.integrationtest
 def test_multiple_indexes(instrument, elasticapm_client, elasticsearch):
-    elasticsearch.create(index="tweets", doc_type="users", id=1, body={"user": "kimchy", "text": "hola"}, refresh=True)
-    elasticsearch.create(index="snaps", doc_type="posts", id=1, body={"user": "kimchy", "text": "hola"}, refresh=True)
+    elasticsearch.create(index="tweets", id="1", refresh=True, **get_kwargs({"user": "kimchy", "text": "hola"}))
+    elasticsearch.create(index="snaps", id="1", refresh=True, **get_kwargs({"user": "kimchy", "text": "hola"}))
     elasticapm_client.begin_transaction("test")
     result = elasticsearch.search(index=["tweets", "snaps"], q="user:kimchy")
     elasticapm_client.end_transaction("test", "OK")

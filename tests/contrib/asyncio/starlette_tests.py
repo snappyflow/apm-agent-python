@@ -28,9 +28,12 @@
 #  OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import pytest  # isort:skip
+from shutil import ExecError
 
 from tests.fixtures import TempStoreClient
+
+import pytest  # isort:skip
+
 
 starlette = pytest.importorskip("starlette")  # isort:skip
 
@@ -38,6 +41,7 @@ import os
 
 import mock
 import urllib3
+import wrapt
 from starlette.applications import Starlette
 from starlette.responses import PlainTextResponse
 from starlette.staticfiles import StaticFiles
@@ -47,7 +51,6 @@ import elasticapm
 from elasticapm import async_capture_span
 from elasticapm.conf import constants
 from elasticapm.contrib.starlette import ElasticAPM, make_apm_client
-from elasticapm.utils import wrapt
 from elasticapm.utils.disttracing import TraceParent
 
 pytestmark = [pytest.mark.starlette]
@@ -65,12 +68,18 @@ def app(elasticapm_client):
     app.mount("/sub", sub)
     sub.mount("/subsub", subsub)
 
+    @app.exception_handler(Exception)
+    async def handle_exception(request, exc):
+        transaction_id = elasticapm.get_transaction_id()
+        exc.transaction_id = transaction_id
+        return PlainTextResponse(f"{transaction_id}", status_code=500)
+
     @app.route("/", methods=["GET", "POST"])
     async def hi(request):
-        await request.body()
+        body = await request.body()
         with async_capture_span("test"):
             pass
-        return PlainTextResponse("ok")
+        return PlainTextResponse(str(len(body)))
 
     @app.route("/hi/{name}", methods=["GET"])
     async def hi_name(request):
@@ -87,6 +96,11 @@ def app(elasticapm_client):
     async def raise_exception(request):
         await request.body()
         raise ValueError()
+
+    @app.route("/raise-base-exception", methods=["GET", "POST"])
+    async def raise_base_exception(request):
+        await request.body()
+        raise Exception()
 
     @app.route("/hi/{name}/with/slash/", methods=["GET", "POST"])
     async def with_slash(request):
@@ -145,6 +159,10 @@ def test_get(app, elasticapm_client):
     request = transaction["context"]["request"]
     assert request["method"] == "GET"
     assert request["socket"] == {"remote_address": "127.0.0.1"}
+
+    response = transaction["context"]["response"]
+    assert response["status_code"] == 200
+    assert response["headers"]["content-type"] == "text/plain; charset=utf-8"
 
     assert span["name"] == "test"
 
@@ -246,11 +264,17 @@ def test_capture_headers_body_is_dynamic(app, elasticapm_client):
 
     for i, val in enumerate((True, False)):
         elasticapm_client.config.update(str(i), capture_body="transaction" if val else "none", capture_headers=val)
-        client.post("/", "somedata", headers={"foo": "bar"})
+        try:
+            client.post("/", content="somedata", headers={"foo": "bar"})
+        except TypeError:  # starlette < 0.21.0 used requests as base for TestClient, with a different API
+            client.post("/", "somedata", headers={"foo": "bar"})
 
         elasticapm_client.config.update(str(i) + str(i), capture_body="error" if val else "none", capture_headers=val)
         with pytest.raises(ValueError):
-            client.post("/raise-exception", "somedata", headers={"foo": "bar"})
+            try:
+                client.post("/raise-exception", content="somedata", headers={"foo": "bar"})
+            except TypeError:
+                client.post("/raise-exception", "somedata", headers={"foo": "bar"})
 
     assert "headers" in elasticapm_client.events[constants.TRANSACTION][0]["context"]["request"]
     assert "headers" in elasticapm_client.events[constants.TRANSACTION][0]["context"]["response"]
@@ -422,6 +446,32 @@ def test_static_files_only(app_static_files_only, elasticapm_client):
     assert request["socket"] == {"remote_address": "127.0.0.1"}
 
 
+def test_non_utf_8_body_in_ignored_paths_with_capture_body(app, elasticapm_client):
+    client = TestClient(app)
+    elasticapm_client.config.update(1, capture_body="all", transaction_ignore_urls="/hello")
+    response = client.post("/hello", data=b"b$\x19\xc2")
+    assert response.status_code == 200
+    assert len(elasticapm_client.events[constants.TRANSACTION]) == 0
+
+
+@pytest.mark.parametrize("elasticapm_client", [{"capture_body": "all"}], indirect=True)
+def test_long_body(app, elasticapm_client):
+    client = TestClient(app)
+
+    response = client.post(
+        "/",
+        data={"foo": "b" * 10000},
+    )
+
+    assert response.status_code == 200
+
+    assert len(elasticapm_client.events[constants.TRANSACTION]) == 1
+    transaction = elasticapm_client.events[constants.TRANSACTION][0]
+    request = transaction["context"]["request"]
+    assert request["body"] == "foo=" + "b" * 9993 + "..."
+    assert response.text == "10004"
+
+
 def test_static_files_only_file_notfound(app_static_files_only, elasticapm_client):
     client = TestClient(app_static_files_only)
 
@@ -472,3 +522,15 @@ def test_websocket(app, elasticapm_client):
         assert data == "Hello, world!"
 
     assert len(elasticapm_client.events[constants.TRANSACTION]) == 0
+
+
+def test_transaction_active_in_base_exception_handler(app, elasticapm_client):
+    client = TestClient(app)
+    try:
+        response = client.get("/raise-base-exception")
+    except Exception as exc:
+        # This is set by the exception handler -- we want to make sure the
+        # handler has access to the transaction.
+        assert exc.transaction_id
+
+    assert len(elasticapm_client.events[constants.TRANSACTION]) == 1

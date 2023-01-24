@@ -31,9 +31,9 @@
 import threading
 import time
 from collections import defaultdict
+from typing import Union
 
 from elasticapm.conf import constants
-from elasticapm.utils import compat
 from elasticapm.utils.logging import get_logger
 from elasticapm.utils.module_import import import_string
 from elasticapm.utils.threading import IntervalTimer, ThreadManager
@@ -57,25 +57,36 @@ class MetricsRegistry(ThreadManager):
         self._collect_timer = None
         super(MetricsRegistry, self).__init__()
 
-    def register(self, class_path):
+    def register(self, metricset: Union[str, type]) -> "MetricSet":
         """
         Register a new metric set
-        :param class_path: a string with the import path of the metricset class
-        """
-        if class_path in self._metricsets:
-            return
-        else:
-            try:
-                class_obj = import_string(class_path)
-                self._metricsets[class_path] = class_obj(self)
-            except ImportError as e:
-                logger.warning("Could not register %s metricset: %s", class_path, compat.text_type(e))
 
-    def get_metricset(self, class_path):
+        :param metricset: a string with the import path of the metricset class,
+            or a class object that can be used to instantiate the metricset.
+            If a class object is used, you can use the class object or
+            `metricset.__name__` to retrieve the metricset using `get_metricset`.
+        :return: the metricset instance
+        """
+        class_id = metricset if isinstance(metricset, str) else f"{metricset.__module__}.{metricset.__name__}"
+        if class_id in self._metricsets:
+            return self._metricsets[class_id]
+        else:
+            if isinstance(metricset, str):
+                try:
+                    class_obj = import_string(metricset)
+                    self._metricsets[metricset] = class_obj(self)
+                except ImportError as e:
+                    logger.warning("Could not register %s metricset: %s", metricset, str(e))
+            else:
+                self._metricsets[class_id] = metricset(self)
+        return self._metricsets.get(class_id)
+
+    def get_metricset(self, metricset: Union[str, type]) -> "MetricSet":
+        metricset = metricset if isinstance(metricset, str) else f"{metricset.__module__}.{metricset.__name__}"
         try:
-            return self._metricsets[class_path]
+            return self._metricsets[metricset]
         except KeyError:
-            raise MetricSetNotFound(class_path)
+            raise MetricSetNotFound(metricset)
 
     def collect(self):
         """
@@ -85,7 +96,7 @@ class MetricsRegistry(ThreadManager):
         if self.client.config.is_recording:
             logger.debug("Collecting metrics")
 
-            for _, metricset in compat.iteritems(self._metricsets):
+            for _, metricset in self._metricsets.items():
                 for data in metricset.collect():
                     self.client.queue(constants.METRICSET, data)
 
@@ -108,14 +119,14 @@ class MetricsRegistry(ThreadManager):
 
     @property
     def collect_interval(self):
-        return self.client.config.metrics_interval / 1000.0
+        return self.client.config.metrics_interval.total_seconds()
 
     @property
     def ignore_patterns(self):
         return self.client.config.disable_metrics or []
 
 
-class MetricsSet(object):
+class MetricSet(object):
     def __init__(self, registry):
         self._lock = threading.Lock()
         self._counters = {}
@@ -209,7 +220,7 @@ class MetricsSet(object):
         samples = defaultdict(dict)
         if self._counters:
             # iterate over a copy of the dict to avoid threading issues, see #717
-            for (name, labels), counter in compat.iteritems(self._counters.copy()):
+            for (name, labels), counter in self._counters.copy().items():
                 if counter is not noop_metric:
                     val = counter.val
                     if val or not counter.reset_on_collect:
@@ -217,7 +228,7 @@ class MetricsSet(object):
                     if counter.reset_on_collect:
                         counter.reset()
         if self._gauges:
-            for (name, labels), gauge in compat.iteritems(self._gauges.copy()):
+            for (name, labels), gauge in self._gauges.copy().items():
                 if gauge is not noop_metric:
                     val = gauge.val
                     if val or not gauge.reset_on_collect:
@@ -225,7 +236,7 @@ class MetricsSet(object):
                     if gauge.reset_on_collect:
                         gauge.reset()
         if self._timers:
-            for (name, labels), timer in compat.iteritems(self._timers.copy()):
+            for (name, labels), timer in self._timers.copy().items():
                 if timer is not noop_metric:
                     val, count = timer.val
                     if val or not timer.reset_on_collect:
@@ -237,7 +248,7 @@ class MetricsSet(object):
                     if timer.reset_on_collect:
                         timer.reset()
         if self._histograms:
-            for (name, labels), histo in compat.iteritems(self._histograms.copy()):
+            for (name, labels), histo in self._histograms.copy().items():
                 if histo is not noop_metric:
                     counts = histo.val
                     if counts or not histo.reset_on_collect:
@@ -269,7 +280,7 @@ class MetricsSet(object):
                         histo.reset()
 
         if samples:
-            for labels, sample in compat.iteritems(samples):
+            for labels, sample in samples.items():
                 result = {"samples": sample, "timestamp": timestamp}
                 if labels:
                     result["tags"] = {k: v for k, v in labels}
@@ -283,13 +294,17 @@ class MetricsSet(object):
         pass
 
     def before_yield(self, data):
+        """
+        A method that is called right before the data is yielded to be sent
+        to Elasticsearch. Can be used to modify the data.
+        """
         return data
 
     def _labels_to_key(self, labels):
-        return tuple((k, compat.text_type(v)) for k, v in sorted(compat.iteritems(labels)))
+        return tuple((k, str(v)) for k, v in sorted(labels.items()))
 
 
-class SpanBoundMetricSet(MetricsSet):
+class SpanBoundMetricSet(MetricSet):
     def before_yield(self, data):
         tags = data.get("tags", None)
         if tags:
@@ -392,8 +407,8 @@ class Timer(BaseMetric):
     __slots__ = BaseMetric.__slots__ + ("_val", "_count", "_lock", "_unit")
 
     def __init__(self, name=None, reset_on_collect=False, unit=None):
-        self._val = 0
-        self._count = 0
+        self._val: float = 0
+        self._count: int = 0
         self._unit = unit
         self._lock = threading.Lock()
         super(Timer, self).__init__(name, reset_on_collect=reset_on_collect)
@@ -496,3 +511,9 @@ noop_metric = NoopMetric("noop")
 class MetricSetNotFound(LookupError):
     def __init__(self, class_path):
         super(MetricSetNotFound, self).__init__("%s metric set not found" % class_path)
+
+
+# This is for backwards compatibility for the brave souls who were using
+# the undocumented system for custom metrics before we fixed it up and
+# documented it.
+MetricsSet = MetricSet

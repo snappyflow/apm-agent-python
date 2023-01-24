@@ -40,16 +40,19 @@ import re
 import sys
 import threading
 import time
+import urllib.parse
 import warnings
 from copy import deepcopy
-from typing import Optional, Tuple
+from datetime import timedelta
+from typing import Optional, Sequence, Tuple
 
 import elasticapm
 from elasticapm.conf import Config, VersionedConfig, constants
 from elasticapm.conf.constants import ERROR
 from elasticapm.metrics.base_metrics import MetricsRegistry
-from elasticapm.traces import Tracer, execution_context
+from elasticapm.traces import DroppedSpan, Tracer, execution_context
 from elasticapm.utils import cgroup, cloud, compat, is_master_process, stacks, varmap
+from elasticapm.utils.disttracing import TraceParent
 from elasticapm.utils.encoding import enforce_label_format, keyword_field, shorten, transform
 from elasticapm.utils.logging import get_logger
 from elasticapm.utils.module_import import import_string
@@ -114,13 +117,16 @@ class Client(object):
             for msg in config.errors.values():
                 self.error_logger.error(msg)
             config.disable_send = True
-        if config.service_name == "python_service":
-            self.logger.warning("No custom SERVICE_NAME was set -- using non-descript default 'python_service'")
+        if config.service_name == "unknown-python-service":
+            self.logger.warning("No custom SERVICE_NAME was set -- using non-descript default 'unknown-python-service'")
+        if config.service_name.strip() == "":
+            self.logger.error(
+                "SERVICE_NAME cannot be whitespace-only. Please set the SERVICE_NAME to a useful identifier."
+            )
         self.config = VersionedConfig(config, version=None)
 
         # Insert the log_record_factory into the logging library
-        # The LogRecordFactory functionality is only available on python 3.2+
-        if compat.PY3 and not self.config.disable_log_record_factory:
+        if not self.config.disable_log_record_factory:
             record_factory = logging.getLogRecordFactory()
             # Only way to know if it's wrapped is to create a log record
             throwaway_record = record_factory(__name__, logging.DEBUG, __file__, 252, "dummy_msg", [], None)
@@ -134,8 +140,6 @@ class Client(object):
                 logging.setLogRecordFactory(new_factory)
 
         headers = {
-            "Content-Type": "application/x-ndjson",
-            "Content-Encoding": "gzip",
             "User-Agent": self.get_user_agent(),
         }
 
@@ -146,7 +150,7 @@ class Client(object):
             "timeout": self.config.server_timeout,
             "processors": self.load_processors(),
         }
-        self._api_endpoint_url = compat.urlparse.urljoin(
+        self._api_endpoint_url = urllib.parse.urljoin(
             self.config.server_url if self.config.server_url.endswith("/") else self.config.server_url + "/",
             constants.EVENTS_API_PATH,
         )
@@ -194,15 +198,15 @@ class Client(object):
         )
         self.include_paths_re = stacks.get_path_regex(self.config.include_paths) if self.config.include_paths else None
         self.exclude_paths_re = stacks.get_path_regex(self.config.exclude_paths) if self.config.exclude_paths else None
-        self._metrics = MetricsRegistry(self)
+        self.metrics = MetricsRegistry(self)
         for path in self.config.metrics_sets:
-            self._metrics.register(path)
+            self.metrics.register(path)
         if self.config.breakdown_metrics:
-            self._metrics.register("elasticapm.metrics.sets.breakdown.BreakdownMetricSet")
+            self.metrics.register("elasticapm.metrics.sets.breakdown.BreakdownMetricSet")
         if self.config.prometheus_metrics:
-            self._metrics.register("elasticapm.metrics.sets.prometheus.PrometheusMetrics")
+            self.metrics.register("elasticapm.metrics.sets.prometheus.PrometheusMetrics")
         if self.config.metrics_interval:
-            self._thread_managers["metrics"] = self._metrics
+            self._thread_managers["metrics"] = self.metrics
         compat.atexit_register(self.close)
         if self.config.central_config:
             self._thread_managers["config"] = self.config
@@ -283,17 +287,28 @@ class Client(object):
             flush = False
         self._transport.queue(event_type, data, flush)
 
-    def begin_transaction(self, transaction_type, trace_parent=None, start=None):
+    def begin_transaction(
+        self,
+        transaction_type: str,
+        trace_parent: Optional[TraceParent] = None,
+        start: Optional[float] = None,
+        auto_activate: bool = True,
+        links: Optional[Sequence[TraceParent]] = None,
+    ):
         """
         Register the start of a transaction on the client
 
         :param transaction_type: type of the transaction, e.g. "request"
         :param trace_parent: an optional TraceParent object for distributed tracing
         :param start: override the start timestamp, mostly useful for testing
+        :param auto_activate: whether to set this transaction in execution_context
+        :param links: a sequence of traceparent objects to causally link this transaction with
         :return: the started transaction object
         """
         if self.config.is_recording:
-            return self.tracer.begin_transaction(transaction_type, trace_parent=trace_parent, start=start)
+            return self.tracer.begin_transaction(
+                transaction_type, trace_parent=trace_parent, start=start, auto_activate=auto_activate, links=links
+            )
 
     def end_transaction(self, name=None, result="", duration=None):
         """
@@ -304,6 +319,8 @@ class Client(object):
         :param duration: override duration, mostly useful for testing
         :return: the ended transaction object
         """
+        if duration is not None and not isinstance(duration, timedelta):
+            duration = timedelta(seconds=duration)
         transaction = self.tracer.end_transaction(result, name, duration=duration)
         return transaction
 
@@ -452,6 +469,8 @@ class Client(object):
         """
         transaction = execution_context.get_transaction()
         span = execution_context.get_span()
+        while isinstance(span, DroppedSpan):
+            span = span.parent
         if transaction:
             transaction_context = deepcopy(transaction.context)
         else:
@@ -474,6 +493,12 @@ class Client(object):
         event_data["context"] = context
         if transaction and transaction.labels:
             context["tags"] = deepcopy(transaction.labels)
+        # No intake for otel.attributes, so make them labels
+        if "otel_attributes" in context:
+            if context.get("tags"):
+                context["tags"].update(context.pop("otel_attributes"))
+            else:
+                context["tags"] = context.pop("otel_attributes")
 
         # if '.' not in event_type:
         # Assume it's a builtin
@@ -488,7 +513,7 @@ class Client(object):
         if custom.get("culprit"):
             culprit = custom.pop("culprit")
 
-        for k, v in compat.iteritems(result):
+        for k, v in result.items():
             if k not in event_data:
                 event_data[k] = v
 
@@ -520,7 +545,7 @@ class Client(object):
         if "stacktrace" in log and not culprit:
             culprit = stacks.get_culprit(log["stacktrace"], self.config.include_paths, self.config.exclude_paths)
 
-        if "level" in log and isinstance(log["level"], compat.integer_types):
+        if "level" in log and isinstance(log["level"], int):
             log["level"] = logging.getLevelName(log["level"]).lower()
 
         if log:
@@ -547,7 +572,11 @@ class Client(object):
             # parent id might already be set in the handler
             event_data.setdefault("parent_id", span.id if span else transaction.id)
             event_data["transaction_id"] = transaction.id
-            event_data["transaction"] = {"sampled": transaction.is_sampled, "type": transaction.transaction_type}
+            event_data["transaction"] = {
+                "sampled": transaction.is_sampled,
+                "type": transaction.transaction_type,
+                "name": transaction.name,
+            }
 
         return event_data
 
@@ -612,9 +641,18 @@ class Client(object):
         return [seen.setdefault(path, import_string(path)) for path in processors if path not in seen]
 
     def should_ignore_url(self, url):
+        """Checks if URL should be ignored based on the transaction_ignore_urls setting"""
         if self.config.transaction_ignore_urls:
             for pattern in self.config.transaction_ignore_urls:
                 if pattern.match(url):
+                    return True
+        return False
+
+    def should_ignore_topic(self, topic: str) -> bool:
+        """Checks if messaging topic should be ignored based on the ignore_message_queues setting"""
+        if self.config.ignore_message_queues:
+            for pattern in self.config.ignore_message_queues:
+                if pattern.match(topic):
                     return True
         return False
 
@@ -631,7 +669,9 @@ class Client(object):
         elif v < (3, 5):
             warnings.warn("The Elastic APM agent only supports Python 3.5+", DeprecationWarning)
 
-    def check_server_version(self, gte: Optional[Tuple[int]] = None, lte: Optional[Tuple[int]] = None) -> bool:
+    def check_server_version(
+        self, gte: Optional[Tuple[int, ...]] = None, lte: Optional[Tuple[int, ...]] = None
+    ) -> bool:
         """
         Check APM Server version against greater-or-equal and/or lower-or-equal limits, provided as tuples of integers.
         If server_version is not set, always returns True.
@@ -642,8 +682,13 @@ class Client(object):
         if not self.server_version:
             return True
         gte = gte or (0,)
-        lte = lte or (2 ** 32,)  # let's assume APM Server version will never be greater than 2^32
+        lte = lte or (2**32,)  # let's assume APM Server version will never be greater than 2^32
         return bool(gte <= self.server_version <= lte)
+
+    @property
+    def _metrics(self):
+        warnings.warn(DeprecationWarning("Use `client.metrics` instead"))
+        return self.metrics
 
 
 class DummyClient(Client):

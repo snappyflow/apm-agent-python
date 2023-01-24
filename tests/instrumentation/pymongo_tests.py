@@ -99,7 +99,7 @@ def test_collection_count(instrument, elasticapm_client, mongo_database):
     assert span["context"]["destination"] == {
         "address": os.environ.get("MONGODB_HOST", "localhost"),
         "port": int(os.environ.get("MONGODB_PORT", 27017)),
-        "service": {"name": "", "resource": "mongodb", "type": ""},
+        "service": {"name": "", "resource": "mongodb/elasticapm_test", "type": ""},
     }
 
 
@@ -121,8 +121,10 @@ def test_collection_count_documents(instrument, elasticapm_client, mongo_databas
     assert span["context"]["destination"] == {
         "address": os.environ.get("MONGODB_HOST", "localhost"),
         "port": int(os.environ.get("MONGODB_PORT", 27017)),
-        "service": {"name": "", "resource": "mongodb", "type": ""},
+        "service": {"name": "", "resource": "mongodb/elasticapm_test", "type": ""},
     }
+    assert span["context"]["service"]["target"]["type"] == "mongodb"
+    assert span["context"]["service"]["target"]["name"] == "elasticapm_test"
 
 
 @pytest.mark.skipif(pymongo.version_tuple < (3, 7), reason="New in 3.7")
@@ -143,8 +145,10 @@ def test_collection_estimated_document_count(instrument, elasticapm_client, mong
     assert span["context"]["destination"] == {
         "address": os.environ.get("MONGODB_HOST", "localhost"),
         "port": int(os.environ.get("MONGODB_PORT", 27017)),
-        "service": {"name": "", "resource": "mongodb", "type": ""},
+        "service": {"name": "", "resource": "mongodb/elasticapm_test", "type": ""},
     }
+    assert span["context"]["service"]["target"]["type"] == "mongodb"
+    assert span["context"]["service"]["target"]["name"] == "elasticapm_test"
 
 
 @pytest.mark.integrationtest
@@ -254,7 +258,7 @@ def test_collection_find(instrument, elasticapm_client, mongo_database):
         assert span["context"]["destination"] == {
             "address": os.environ.get("MONGODB_HOST", "localhost"),
             "port": int(os.environ.get("MONGODB_PORT", 27017)),
-            "service": {"name": "", "resource": "mongodb", "type": ""},
+            "service": {"name": "", "resource": "mongodb/elasticapm_test", "type": ""},
         }
 
 
@@ -276,7 +280,7 @@ def test_collection_find_one(instrument, elasticapm_client, mongo_database):
     assert span["context"]["destination"] == {
         "address": os.environ.get("MONGODB_HOST", "localhost"),
         "port": int(os.environ.get("MONGODB_PORT", 27017)),
-        "service": {"name": "", "resource": "mongodb", "type": ""},
+        "service": {"name": "", "resource": "mongodb/elasticapm_test", "type": ""},
     }
 
 
@@ -366,6 +370,30 @@ def test_bulk_execute(instrument, elasticapm_client, mongo_database):
     assert span["subtype"] == "mongodb"
     assert span["action"] == "query"
     assert span["name"] == "elasticapm_test.test_bulk.bulk.execute"
+
+
+@pytest.mark.skipif(pymongo.version_tuple < (3, 7), reason="New in 3.7")
+@pytest.mark.parametrize(
+    "elasticapm_client",
+    [
+        {
+            "span_compression_enabled": True,
+            "span_compression_same_kind_max_duration": "5ms",
+            "span_compression_exact_match_max_duration": "50ms",
+        }
+    ],
+    indirect=True,
+)
+@pytest.mark.integrationtest
+def test_mongodb_span_compression(instrument, elasticapm_client, mongo_database):
+    elasticapm_client.begin_transaction("transaction.test")
+    for i in range(5):
+        blogpost = {"author": "Tom%d" % i, "text": "Foo", "date": datetime.datetime.utcnow()}
+        mongo_database.blogposts.insert_one(blogpost)
+    elasticapm_client.end_transaction("transaction.test")
+    transactions = elasticapm_client.events[TRANSACTION]
+    spans = elasticapm_client.spans_for_transaction(transactions[0])
+    assert len(spans) == 1
 
 
 def _get_pymongo_span(spans):

@@ -10,12 +10,14 @@ FRAMEWORK:
   - flask-0.12
   - flask-1.1
   - flask-2.0
+  - jinja2-3
+  - opentelemetry-newest
   - opentracing-newest
-  - twisted-18
-  - celery-3-flask-1.0
-  - celery-3-django-2.0
+  - twisted-newest
   - celery-4-flask-1.0
   - celery-4-django-2.0
+  - celery-5-flask-2
+  - celery-5-django-4
   - requests-newest
   - boto3-newest
   - pymongo-newest
@@ -28,13 +30,12 @@ FRAMEWORK:
   - memcached-newest
   - pylibmc-newest
   - elasticsearch-2
-  - elasticsearch-6
   - elasticsearch-7
+  - elasticsearch-8
   - cassandra-newest
   - psutil-newest
   #- eventlet-newest
   - gevent-newest
-  - zerorpc-0.4
   - mysql_connector-newest
   - pymysql-newest
   - mysqlclient-newest
@@ -42,7 +43,7 @@ FRAMEWORK:
   - aiopg-newest
   - asyncpg-newest
   - tornado-newest
-  # - starlette-newest # disabled for now, see https://github.com/elastic/apm-agent-python/issues/1172
+  - starlette-newest
   - pymemcache-newest
   - graphene-2
   - httpx-newest
@@ -50,3 +51,6 @@ FRAMEWORK:
   - prometheus_client-newest
   - sanic-newest
   - aiomysql-newest
+  - aiobotocore-newest
+  - kafka-python-newest
+  - grpc-newest

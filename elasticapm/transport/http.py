@@ -34,13 +34,15 @@ import hashlib
 import json
 import re
 import ssl
+import urllib.parse
+from urllib.request import getproxies_environment, proxy_bypass_environment
 
 import urllib3
 from urllib3.exceptions import MaxRetryError, TimeoutError
 
 from elasticapm.transport.exceptions import TransportException
 from elasticapm.transport.http_base import HTTPTransportBase
-from elasticapm.utils import compat, json_encoder, read_pem_file
+from elasticapm.utils import json_encoder, read_pem_file
 from elasticapm.utils.logging import get_logger
 
 try:
@@ -68,16 +70,21 @@ class Transport(HTTPTransportBase):
         self._http = None
         self._url = url
 
-    def send(self, data):
+    def send(self, data, forced_flush=False):
         response = None
 
         headers = self._headers.copy() if self._headers else {}
         headers.update(self.auth_headers)
+        headers.update(
+            {
+                b"Content-Type": b"application/x-ndjson",
+                b"Content-Encoding": b"gzip",
+            }
+        )
 
-        if compat.PY2 and isinstance(self._url, compat.text_type):
-            url = self._url.encode("utf-8")
-        else:
-            url = self._url
+        url = self._url
+        if forced_flush:
+            url = f"{url}?flushed=true"
         try:
             try:
                 response = self.http.urlopen(
@@ -113,10 +120,10 @@ class Transport(HTTPTransportBase):
     @property
     def http(self) -> urllib3.PoolManager:
         if not self._http:
-            url_parts = compat.urlparse.urlparse(self._url)
-            proxies = compat.getproxies_environment()
+            url_parts = urllib.parse.urlparse(self._url)
+            proxies = getproxies_environment()
             proxy_url = proxies.get("https", proxies.get("http", None))
-            if proxy_url and not compat.proxy_bypass_environment(url_parts.netloc):
+            if proxy_url and not proxy_bypass_environment(url_parts.netloc):
                 self._http = urllib3.ProxyManager(proxy_url, **self._pool_kwargs)
             else:
                 self._http = urllib3.PoolManager(**self._pool_kwargs)
@@ -145,7 +152,6 @@ class Transport(HTTPTransportBase):
         data = json_encoder.dumps(keys).encode("utf-8")
         headers = self._headers.copy()
         headers[b"Content-Type"] = "application/json"
-        headers.pop(b"Content-Encoding", None)  # remove gzip content-encoding header
         headers.update(self.auth_headers)
         max_age = 300
         if current_version:
@@ -155,14 +161,12 @@ class Transport(HTTPTransportBase):
                 "POST", url, body=data, headers=headers, timeout=self._timeout, preload_content=False
             )
         except (urllib3.exceptions.RequestError, urllib3.exceptions.HTTPError) as e:
-            logger.debug("HTTP error while fetching remote config: %s", compat.text_type(e))
+            logger.debug("HTTP error while fetching remote config: %s", str(e))
             return current_version, None, max_age
         body = response.read()
-        if "Cache-Control" in response.headers:
-            try:
-                max_age = int(next(re.finditer(r"max-age=(\d+)", response.headers["Cache-Control"])).groups()[0])
-            except StopIteration:
-                logger.debug("Could not parse Cache-Control header: %s", response.headers["Cache-Control"])
+
+        max_age = self._get_cache_control_max_age(response.headers) or max_age
+
         if response.status == 304:
             # config is unchanged, return
             logger.debug("Configuration unchanged")
@@ -181,6 +185,22 @@ class Transport(HTTPTransportBase):
             logger.warning("Failed decoding APM Server response as JSON: %s", body)
             return current_version, None, max_age
 
+    def _get_cache_control_max_age(self, response_headers):
+        max_age = None
+        if "Cache-Control" in response_headers:
+            try:
+                cc_max_age = int(next(re.finditer(r"max-age=(\d+)", response_headers["Cache-Control"])).groups()[0])
+                if cc_max_age <= 0:
+                    # max_age remains at default value
+                    pass
+                elif cc_max_age < 5:
+                    max_age = 5
+                else:
+                    max_age = cc_max_age
+            except StopIteration:
+                logger.debug("Could not parse Cache-Control header: %s", response_headers["Cache-Control"])
+        return max_age
+
     def _process_queue(self):
         # if not self.client.server_version:
         #     self.fetch_server_info()
@@ -189,20 +209,22 @@ class Transport(HTTPTransportBase):
     def fetch_server_info(self):
         headers = self._headers.copy() if self._headers else {}
         headers.update(self.auth_headers)
-        headers["accept"] = "text/plain"
+        headers[b"accept"] = b"text/plain"
         try:
             response = self.http.urlopen("GET", self._server_info_url, headers=headers, timeout=self._timeout)
             body = response.data
             data = json_encoder.loads(body.decode("utf8"))
             version = data["version"]
-            logger.info("Fetched APM Server version %s", version)
+            logger.debug("Fetched APM Server version %s", version)
             self.client.server_version = version_string_to_tuple(version)
         except (urllib3.exceptions.RequestError, urllib3.exceptions.HTTPError) as e:
-            logger.warning("HTTP error while fetching server information: %s", str(e))
+            logger.debug("HTTP error while fetching server information: %s", str(e))
         except json.JSONDecodeError as e:
-            logger.warning("JSON decoding error while fetching server information: %s", str(e))
+            logger.debug(
+                f"JSON decoding error while fetching server information. Error: {str(e)} Body: {body.decode('utf8')}"
+            )
         except (KeyError, TypeError):
-            logger.warning("No version key found in server response: %s", response.data)
+            logger.debug("No version key found in server response: %s", response.data)
 
     @property
     def cert_fingerprint(self):
@@ -217,7 +239,7 @@ class Transport(HTTPTransportBase):
     @property
     def auth_headers(self):
         headers = super(Transport, self).auth_headers
-        return {k.encode("ascii"): v.encode("ascii") for k, v in compat.iteritems(headers)}
+        return {k.encode("ascii"): v.encode("ascii") for k, v in headers.items()}
 
     @property
     def ca_certs(self):

@@ -30,17 +30,22 @@
 
 import codecs
 import gzip
+import io
+import itertools
 import json
 import logging
 import logging.handlers
 import os
 import random
 import socket
+import socketserver
 import sys
 import tempfile
 import time
+import warnings
 import zlib
 from collections import defaultdict
+from typing import Optional
 
 import jsonschema
 import mock
@@ -53,7 +58,6 @@ from elasticapm.base import Client
 from elasticapm.conf.constants import SPAN
 from elasticapm.traces import execution_context
 from elasticapm.transport.http_base import HTTPTransportBase
-from elasticapm.utils import compat
 from elasticapm.utils.threading import ThreadManager
 
 try:
@@ -69,6 +73,9 @@ TRANSACTIONS_SCHEMA = os.path.join(cur_dir, "upstream", "json-specs", "transacti
 SPAN_SCHEMA = os.path.join(cur_dir, "upstream", "json-specs", "span.json")
 METRICSET_SCHEMA = os.path.join(cur_dir, "upstream", "json-specs", "metricset.json")
 METADATA_SCHEMA = os.path.join(cur_dir, "upstream", "json-specs", "metadata.json")
+
+with open(os.path.join(cur_dir, "upstream", "json-specs", "span_types.json")) as f:
+    SPAN_TYPES = json.load(f)
 
 
 with codecs.open(ERRORS_SCHEMA, encoding="utf8") as errors_json, codecs.open(
@@ -113,6 +120,33 @@ with codecs.open(ERRORS_SCHEMA, encoding="utf8") as errors_json, codecs.open(
     }
 
 
+def validate_span_type_subtype(item: dict) -> Optional[str]:
+    """
+    Validate span type/subtype against spec.
+
+    At first, only warnings are issued. At a later point, it should return the message as string
+    which will cause a validation error.
+    """
+    if item["type"] not in SPAN_TYPES:
+        warnings.warn(f"Span type \"{item['type']}\" not found in JSON spec", UserWarning)
+        return
+    span_type = SPAN_TYPES[item["type"]]
+    subtypes = span_type.get("subtypes", [])
+    if not subtypes and item["subtype"] and not span_type.get("allow_unlisted_subtype", False):
+        warnings.warn(
+            f"Span type \"{item['type']}\" has no subtypes, but subtype \"{item['subtype']}\" is set", UserWarning
+        )
+        return
+    if item["subtype"] not in SPAN_TYPES[item["type"]].get("subtypes", []):
+        if not SPAN_TYPES[item["type"]].get("allow_unlisted_subtype", False):
+            warnings.warn(f"Subtype \"{item['subtype']}\" not allowed for span type \"{item['type']}\"", UserWarning)
+            return
+    else:
+        if "python" not in subtypes.get(item["subtype"], {}).get("__used_by", []):
+            warnings.warn(f"\"{item['type']}.{item['subtype']}\" not marked as used by Python", UserWarning)
+    return None
+
+
 class ValidatingWSGIApp(ContentServer):
     def __init__(self, **kwargs):
         self.skip_validate = kwargs.pop("skip_validate", False)
@@ -128,7 +162,7 @@ class ValidatingWSGIApp(ContentServer):
         if request.content_encoding == "deflate":
             data = zlib.decompress(data)
         elif request.content_encoding == "gzip":
-            with gzip.GzipFile(fileobj=compat.BytesIO(data)) as f:
+            with gzip.GzipFile(fileobj=io.BytesIO(data)) as f:
                 data = f.read()
         data = data.decode(request.charset)
         if request.content_type == "application/x-ndjson":
@@ -146,7 +180,12 @@ class ValidatingWSGIApp(ContentServer):
                     success += 1
                 except jsonschema.ValidationError as e:
                     fail += 1
-                    content += "/".join(map(compat.text_type, e.absolute_schema_path)) + ": " + e.message + "\n"
+                    content += "/".join(map(str, e.absolute_schema_path)) + ": " + e.message + "\n"
+                if item_type == "span":
+                    result = validate_span_type_subtype(item)
+                    if result:
+                        fail += 1
+                        content += result
             code = 202 if not fail else 400
         response = Response(status=code)
         response.headers.clear()
@@ -186,19 +225,23 @@ def elasticapm_client(request):
     client_config.setdefault("secret_token", "test_key")
     client_config.setdefault("central_config", "false")
     client_config.setdefault("include_paths", ("*/tests/*",))
-    client_config.setdefault("span_frames_min_duration", -1)
+    client_config.setdefault("span_stack_trace_min_duration", 0)
     client_config.setdefault("metrics_interval", "0ms")
     client_config.setdefault("cloud_provider", False)
     client_config.setdefault("span_compression_exact_match_max_duration", "0ms")
     client_config.setdefault("span_compression_same_kind_max_duration", "0ms")
+    client_config.setdefault("exit_span_min_duration", "0ms")
     client = TempStoreClient(**client_config)
     yield client
     client.close()
     # clear any execution context that might linger around
     sys.excepthook = original_exceptionhook
     execution_context.set_transaction(None)
-    execution_context.set_span(None)
-    assert not client._transport.validation_errors
+    execution_context.unset_span(clear_all=True)
+    if client._transport.validation_errors:
+        pytest.fail(
+            "Validation errors:" + "\n".join(*itertools.chain(v for v in client._transport.validation_errors.values()))
+        )
 
 
 @pytest.fixture()
@@ -219,7 +262,7 @@ def elasticapm_client_log_file(request):
     client_config.setdefault("secret_token", "test_key")
     client_config.setdefault("central_config", "false")
     client_config.setdefault("include_paths", ("*/tests/*",))
-    client_config.setdefault("span_frames_min_duration", -1)
+    client_config.setdefault("span_stack_trace_min_duration", 0)
     client_config.setdefault("span_compression_exact_match_max_duration", "0ms")
     client_config.setdefault("span_compression_same_kind_max_duration", "0ms")
     client_config.setdefault("metrics_interval", "0ms")
@@ -251,12 +294,12 @@ def elasticapm_client_log_file(request):
     # clear any execution context that might linger around
     sys.excepthook = original_exceptionhook
     execution_context.set_transaction(None)
-    execution_context.set_span(None)
+    execution_context.unset_span(clear_all=True)
 
 
 @pytest.fixture()
 def waiting_httpserver(httpserver):
-    wait_for_http_server(httpserver)
+    wait_for_open_port(httpserver.server_address[1])
     return httpserver
 
 
@@ -279,7 +322,7 @@ def httpsserver_custom(request):
 
 @pytest.fixture()
 def waiting_httpsserver(httpsserver_custom):
-    wait_for_http_server(httpsserver_custom)
+    wait_for_open_port(httpsserver_custom.server_address[1])
     return httpsserver_custom
 
 
@@ -289,7 +332,7 @@ def validating_httpserver(request):
     app = config.pop("app", ValidatingWSGIApp)
     server = app(**config)
     server.start()
-    wait_for_http_server(server)
+    wait_for_open_port(server.server_address[1])
     request.addfinalizer(server.stop)
     return server
 
@@ -302,7 +345,7 @@ def sending_elasticapm_client(request, validating_httpserver):
     client_config.setdefault("service_name", "myapp")
     client_config.setdefault("secret_token", "test_key")
     client_config.setdefault("transport_class", "elasticapm.transport.http.Transport")
-    client_config.setdefault("span_frames_min_duration", -1)
+    client_config.setdefault("span_stack_trace_min_duration", 0)
     client_config.setdefault("span_compression_exact_match_max_duration", "0ms")
     client_config.setdefault("span_compression_same_kind_max_duration", "0ms")
     client_config.setdefault("include_paths", ("*/tests/*",))
@@ -315,7 +358,7 @@ def sending_elasticapm_client(request, validating_httpserver):
     client.close()
     # clear any execution context that might linger around
     execution_context.set_transaction(None)
-    execution_context.set_span(None)
+    execution_context.unset_span(clear_all=True)
 
 
 class DummyTransport(HTTPTransportBase):
@@ -335,6 +378,10 @@ class DummyTransport(HTTPTransportBase):
                 validator.validate(data)
             except jsonschema.ValidationError as e:
                 self.validation_errors[event_type].append(e.message)
+            if event_type == "span":
+                result = validate_span_type_subtype(data)
+                if result:
+                    self.validation_errors[event_type].append(result)
 
     def start_thread(self, pid=None):
         # don't call the parent method, but the one from ThreadManager
@@ -381,13 +428,20 @@ def instrument():
     elasticapm.uninstrument()
 
 
-def wait_for_http_server(httpserver, timeout=30):
+def wait_for_open_port(port: int, host: str = "localhost", timeout: int = 30):
     start_time = time.time()
     while True:
         try:
-            sock = socket.create_connection(httpserver.server_address, timeout=0.1)
+            sock = socket.create_connection((host, port), timeout=0.1)
             sock.close()
             break
         except socket.error:
+            time.sleep(0.01)
             if time.time() - start_time > timeout:
                 raise TimeoutError()
+
+
+def get_free_port() -> int:
+    with socketserver.TCPServer(("localhost", 0), None) as s:
+        free_port = s.server_address[1]
+    return free_port

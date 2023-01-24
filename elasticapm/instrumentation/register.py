@@ -66,6 +66,9 @@ _cls_register = {
     "elasticapm.instrumentation.packages.httpx.sync.httpcore.HTTPCoreInstrumentation",
     "elasticapm.instrumentation.packages.httplib2.Httplib2Instrumentation",
     "elasticapm.instrumentation.packages.azure.AzureInstrumentation",
+    "elasticapm.instrumentation.packages.kafka.KafkaInstrumentation",
+    "elasticapm.instrumentation.packages.grpc.GRPCClientInstrumentation",
+    "elasticapm.instrumentation.packages.grpc.GRPCServerInstrumentation",
 }
 
 if sys.version_info >= (3, 7):
@@ -86,6 +89,8 @@ if sys.version_info >= (3, 7):
             "elasticapm.instrumentation.packages.asyncio.aioredis.RedisPipelineInstrumentation",
             "elasticapm.instrumentation.packages.asyncio.aioredis.RedisConnectionInstrumentation",
             "elasticapm.instrumentation.packages.asyncio.aiomysql.AioMySQLInstrumentation",
+            "elasticapm.instrumentation.packages.asyncio.aiobotocore.AioBotocoreInstrumentation",
+            "elasticapm.instrumentation.packages.asyncio.starlette.StarletteServerErrorMiddlewareInstrumentation",
         ]
     )
 
