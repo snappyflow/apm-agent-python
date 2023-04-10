@@ -286,6 +286,12 @@ def get_frame_info(
         if locals_processor_func:
             f_locals = {varname: locals_processor_func(var) for varname, var in f_locals.items()}
         frame_result["vars"] = transform(f_locals)
+        # Delete timeout field in dict which is causing mapping issue
+        try:
+            if isinstance(frame_result["vars"], dict) and frame_result["vars"].get("timeout"):
+                del frame_result["vars"]["timeout"]
+        except:
+            pass
     return frame_result
 
 
